@@ -1,4 +1,4 @@
-import os, time, requests, ipaddress
+import os, time, requests, ipaddress, json, threading
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -20,6 +20,95 @@ GRAPH_URL = f"https://graph.facebook.com/v18.0/{PIXEL_ID}/events"
 app = Flask(__name__)
 CORS(app, resources={r"/capi/*": {"origins": "*"}})
 
+# ---------------------------
+# Deduplicação (persistente)
+# ---------------------------
+DEDUP_FILE = os.getenv("DEDUP_FILE", "dedup.json")
+# TTL opcional (em horas). Se quiser que “expire” e aceite de novo depois de X horas, defina DEDUP_TTL_HOURS
+DEDUP_TTL_HOURS = float(os.getenv("DEDUP_TTL_HOURS", "0"))  # 0 = sem expiração
+
+_lock = threading.Lock()
+_seen = {}  # dict: uid -> first_seen_epoch
+
+def _now():
+    return int(time.time())
+
+def _load_seen():
+    global _seen
+    if os.path.exists(DEDUP_FILE):
+        try:
+            with open(DEDUP_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # suporta formatos antigos (lista) e novo (dict)
+                if isinstance(data, list):
+                    _seen = {uid: _now() for uid in data}
+                elif isinstance(data, dict):
+                    _seen = {str(k): int(v) for k, v in data.items()}
+                else:
+                    _seen = {}
+        except Exception:
+            _seen = {}
+    else:
+        _seen = {}
+
+def _save_seen():
+    tmp = f"{DEDUP_FILE}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_seen, f, ensure_ascii=False)
+    os.replace(tmp, DEDUP_FILE)
+
+def _maybe_prune():
+    """Remove entradas antigas se DEDUP_TTL_HOURS > 0."""
+    if DEDUP_TTL_HOURS <= 0:
+        return
+    cutoff = _now() - int(DEDUP_TTL_HOURS * 3600)
+    removed = [k for k, ts in _seen.items() if ts < cutoff]
+    if removed:
+        for k in removed:
+            _seen.pop(k, None)
+
+def _extract_uid(payload: dict) -> str | None:
+    """
+    Identificador de usuário em ordem de prioridade:
+    1) user_id (se seu front enviar)
+    2) fbp (cookie)
+    3) fbc (fbclid)
+    4) event_id (por último)
+    """
+    uid = (
+        payload.get("user_id")
+        or payload.get("fbp")
+        or payload.get("fbc")
+        or payload.get("event_id")
+    )
+    if uid:
+        return str(uid)
+    return None
+
+def is_duplicate_and_mark(payload: dict) -> bool:
+    """Retorna True se já vimos esse usuário; caso contrário marca e retorna False."""
+    uid = _extract_uid(payload)
+    if not uid:
+        # Sem identificador → não dá para deduplicar; deixa passar
+        return False
+    with _lock:
+        _maybe_prune()
+        if uid in _seen:
+            return True
+        _seen[uid] = _now()
+        try:
+            _save_seen()
+        except Exception:
+            # Se falhar salvar, seguimos com a memória atual
+            pass
+    return False
+
+# Carrega os já vistos na subida do app
+_load_seen()
+
+# ---------------------------
+# Utilitários de rede / CAPI
+# ---------------------------
 def get_public_ip():
     """Retorna o 1º IP público válido encontrado (ignora privados/loopback/reservados)."""
     xff = request.headers.get("X-Forwarded-For", "")
@@ -75,7 +164,7 @@ def _post_to_meta(event_name: str, j: dict):
     }
 
     if not PIXEL_ID or not ACCESS_TOKEN:
-        print("❌ Faltando META_PIXEL_ID/META_ACCESS_TOKEN (ou FB_*). Configure com `fly secrets set`.", flush=True)
+        print("❌ Faltando META_PIXEL_ID/META_ACCESS_TOKEN (ou FB_*). Configure nas variáveis de ambiente.", flush=True)
         return (jsonify({"error": "missing_secrets"}), 500)
 
     r = requests.post(
@@ -87,16 +176,30 @@ def _post_to_meta(event_name: str, j: dict):
     print(f"📤 CAPI {event_name} →", payload, flush=True)
     print("📥 Meta resp →", r.status_code, r.text, flush=True)
 
-    return ("", 204) if r.ok else (jsonify(r.json()), r.status_code)
+    return ("", 204) if r.ok else (jsonify(_safe_json(r)), r.status_code)
 
+def _safe_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {"status_code": resp.status_code, "text": resp.text[:5000]}
+
+# ---------------------------
+# Endpoints
+# ---------------------------
 @app.post("/capi/lead")
 def capi_lead():
     j = request.get_json(silent=True) or {}
+    # bloqueia usuário repetido
+    if is_duplicate_and_mark(j):
+        # já vimos este usuário → ignora silenciosamente
+        return ("", 204)
     return _post_to_meta("Lead", j)
 
 @app.post("/capi/pageview")
 def capi_pageview():
     j = request.get_json(silent=True) or {}
+    # PageView não é deduplicado
     return _post_to_meta("PageView", j)
 
 @app.get("/")
